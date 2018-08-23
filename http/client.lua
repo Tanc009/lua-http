@@ -10,6 +10,9 @@ local connection_common = require "http.connection_common"
 local onerror = connection_common.onerror
 local new_h1_connection = require "http.h1_connection".new
 local new_h2_connection = require "http.h2_connection".new
+local lpeg = require "lpeg"
+local IPv4_patts = require "lpeg_patterns.IPv4"
+local IPv6_patts = require "lpeg_patterns.IPv6"
 local openssl_ssl = require "openssl.ssl"
 local openssl_ctx = require "openssl.ssl.context"
 local openssl_verify_param = require "openssl.x509.verify_param"
@@ -177,47 +180,58 @@ function records_methods:remove_family(family)
 	end
 end
 
-local function connect(options, timeout)
+local EOF = lpeg.P(-1)
+local IPv4address = IPv4_patts.IPv4address * EOF
+local IPv6addrz = IPv6_patts.IPv6addrz * EOF
+
+local function lookup_records(options, timeout)
 	local family = options.family
 	if family == nil then
 		family = cs.AF_UNSPEC
 	end
 
+	local records = new_records()
+
 	local path = options.path
 	if path then
-		if family == cs.AF_UNSPEC then
-			family = cs.AF_UNIX
-		elseif family ~= cs.AF_UNIX then
+		if family ~= cs.AF_UNSPEC and family ~= cs.AF_UNIX then
 			error("cannot use .path with non-unix address family")
 		end
+		records:add_unix(path)
+		return records
 	end
-
-	local deadline = timeout and monotime()+timeout
 
 	local host = options.host
 
-	local records = new_records()
-
-	if path then
-		records:add_unix(path)
-	elseif http_util.is_ip(host) then
-		if host:find(":", 1, true) then
-			records:add_v6(host)
-		else
-			records:add_v4(host)
-		end
-	else
-		local dns_resolver = options.dns_resolver or cqueues_dns.getpool()
-		if family == cs.AF_UNSPEC then
-			dns_lookup(records, dns_resolver, host, cqueues_dns_record.AAAA, nil, timeout)
-			dns_lookup(records, dns_resolver, host, cqueues_dns_record.A, nil, deadline and deadline-monotime())
-		elseif family == cs.AF_INET then
-			dns_lookup(records, dns_resolver, host, cqueues_dns_record.A, cqueues_dns_record.A, timeout)
-		elseif family == cs.AF_INET6 then
-			dns_lookup(records, dns_resolver, host, cqueues_dns_record.AAAA, cqueues_dns_record.AAAA, timeout)
-		end
-		timeout = deadline and deadline-monotime()
+	local ipv4 = IPv4address:match(host)
+	if ipv4 then
+		records:add_v4(host)
+		return records
 	end
+
+	local ipv6 = IPv6addrz:match(host)
+	if ipv6 then
+		records:add_v6(host)
+		return records
+	end
+
+	local dns_resolver = options.dns_resolver or cqueues_dns.getpool()
+	if family == cs.AF_UNSPEC then
+		local deadline = timeout and monotime()+timeout
+		dns_lookup(records, dns_resolver, host, cqueues_dns_record.AAAA, nil, timeout)
+		dns_lookup(records, dns_resolver, host, cqueues_dns_record.A, nil, deadline and deadline-monotime())
+	elseif family == cs.AF_INET then
+		dns_lookup(records, dns_resolver, host, cqueues_dns_record.A, cqueues_dns_record.A, timeout)
+	elseif family == cs.AF_INET6 then
+		dns_lookup(records, dns_resolver, host, cqueues_dns_record.AAAA, cqueues_dns_record.AAAA, timeout)
+	end
+	return records
+end
+
+local function connect(options, timeout)
+	local deadline = timeout and monotime()+timeout
+
+	local records = lookup_records(options, timeout)
 
 	local bind = options.bind
 	if bind ~= nil then
